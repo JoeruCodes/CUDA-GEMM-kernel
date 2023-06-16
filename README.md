@@ -21,3 +21,6 @@ The verify_result function checks the correctness of the computed matrix multipl
 
  ## Performance Measurement: 
 The code measures the execution time of the matrix multiplication kernel using std::chrono library and calculates the achieved GFLOPs (Giga Floating-Point Operations per second) based on the elapsed time and the problem size.
+
+### GOT ABSOLUTELY DESTROYED BY CuBLAS while testing it on colab
+![KEK](https://media.tenor.com/q_t5-GA1eIkAAAAM/kekw-dow.gif)
