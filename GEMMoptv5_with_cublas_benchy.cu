@@ -4,10 +4,22 @@
 #include <cstdlib>
 #include <iostream>
 #include <vector>
+#include <numeric>
 #include <cuda_fp16.h>
 #include <mma.h>
+#include <cublas_v2.h>
 
 using namespace nvcuda;
+
+#define CUBLAS_CHECK(call)                                               \
+  do {                                                                   \
+    cublasStatus_t status = call;                                        \
+    if (status != CUBLAS_STATUS_SUCCESS) {                               \
+      fprintf(stderr, "cuBLAS error: %d at %s:%d\n", status, __FILE__,   \
+              __LINE__);                                                 \
+      exit(EXIT_FAILURE);                                                \
+    }                                                                    \
+  } while (0)
 
 constexpr int M = 1 << 10;
 constexpr int N = 1 << 11;
@@ -22,12 +34,13 @@ constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
 
 constexpr int BLOCK_THREADS = 128;
+constexpr int NUM_ITERATIONS = 10;
 
 __global__ void convertFloatToHalfKernel(const float* input, __half* output, int num_elements);
 __global__ void wmmaGemmKernel(const __half* __restrict__ a, const __half* __restrict__ b, float* __restrict__ c_float_accum, __half* d_c_ptr_unused, int M_param, int N_param, int K_param);
 
-void verify_result(const std::vector<__half>& a, const std::vector<__half>& b, const std::vector<__half>& c) {
-  std::cout << "Verifying results..." << std::endl;
+void verify_result(const std::vector<__half>& a, const std::vector<__half>& b, const std::vector<__half>& c, const std::string& label) {
+  std::cout << "Verifying results for " << label << "..." << std::endl;
   double max_error = 0.0;
   int error_count = 0;
   float tolerance = 1e-1;
@@ -36,13 +49,21 @@ void verify_result(const std::vector<__half>& a, const std::vector<__half>& b, c
     for (int col = 0; col < N; ++col) {
       float tmp = 0.0f;
       for (int i = 0; i < K; ++i) {
-        tmp += static_cast<float>(a[row * K + i]) * static_cast<float>(b[i * N + col]);
+        if (row * K + i < a.size() && i * N + col < b.size()) {
+            tmp += static_cast<float>(a[row * K + i]) * static_cast<float>(b[i * N + col]);
+        }
       }
 
-      float c_val = static_cast<float>(c[row * N + col]);
+      float c_val = 0.0f;
+      if (row * N + col < c.size()) {
+         c_val = static_cast<float>(c[row * N + col]);
+      }
+
       float diff = abs(tmp - c_val);
-      if (diff > tolerance && error_count < 10) {
-        std::cerr << "Verification failed at (" << row << ", " << col << "): expected " << tmp << ", got " << c_val << ", diff " << diff << std::endl;
+      bool error_condition = (tmp == 0.0f) ? (diff > tolerance) : (diff / abs(tmp) > tolerance);
+
+      if (error_condition && error_count < 10) {
+        std::cerr << "Verification failed at (" << row << ", " << col << ") [" << label << "]: expected " << tmp << ", got " << c_val << ", diff " << diff << std::endl;
         error_count++;
       }
       if (diff > max_error) {
@@ -51,10 +72,10 @@ void verify_result(const std::vector<__half>& a, const std::vector<__half>& b, c
     }
   }
   if (error_count > 0) {
-    std::cerr << "Verification encountered " << error_count << " errors." << std::endl;
-    std::cerr << "Maximum error: " << max_error << std::endl;
+    std::cerr << "Verification encountered " << error_count << " errors for " << label << "." << std::endl;
+    std::cerr << "Maximum error [" << label << "]: " << max_error << std::endl;
   } else {
-    std::cout << "Verification successful. Max error: " << max_error << std::endl;
+    std::cout << "Verification successful for " << label << ". Max error: " << max_error << std::endl;
   }
 }
 
@@ -67,6 +88,7 @@ int main() {
   std::vector<__half> h_a(static_cast<size_t>(M) * K);
   std::vector<__half> h_b(static_cast<size_t>(K) * N);
   std::vector<__half> h_c(static_cast<size_t>(M) * N);
+  std::vector<__half> h_c_cublas(static_cast<size_t>(M) * N);
 
   std::srand(std::time(nullptr));
   std::generate(h_a.begin(), h_a.end(), []() { return static_cast<__half>(static_cast<float>(std::rand() % 5) - 2.0f); });
@@ -79,48 +101,88 @@ int main() {
   cudaMallocManaged(&d_c, bytes_c);
   cudaMallocManaged(&d_c_accum, bytes_c_accum);
 
-  cudaMemset(d_c_accum, 0, bytes_c_accum);
-
   cudaMemcpy(d_a, h_a.data(), bytes_a, cudaMemcpyHostToDevice);
   cudaMemcpy(d_b, h_b.data(), bytes_b, cudaMemcpyHostToDevice);
 
   dim3 blocks((N + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M);
   dim3 threads(BLOCK_THREADS);
 
-  std::cout << "Launching WMMA kernel..." << std::endl;
-  std::cout << "Grid: (" << blocks.x << ", " << blocks.y << "), Block: (" << threads.x << ")" << std::endl;
-
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
 
-  cudaDeviceSynchronize();
+  std::cout << "\n--- Running WMMA Kernel (" << NUM_ITERATIONS << " iterations) ---" << std::endl;
+  std::cout << "Grid: (" << blocks.x << ", " << blocks.y << "), Block: (" << threads.x << ")" << std::endl;
+  std::vector<float> times_wmma;
+  times_wmma.reserve(NUM_ITERATIONS);
+
   cudaMemset(d_c_accum, 0, bytes_c_accum);
+  wmmaGemmKernel<<<blocks, threads>>>(d_a, d_b, d_c_accum, d_c, M, N, K);
   cudaDeviceSynchronize();
 
-  cudaEventRecord(start);
-  wmmaGemmKernel<<<blocks, threads, 0, 0>>>(d_a, d_b, d_c_accum, d_c, M, N, K);
-  cudaEventRecord(stop);
-  cudaEventSynchronize(stop);
+  for (int i = 0; i < NUM_ITERATIONS; ++i) {
+      cudaMemset(d_c_accum, 0, bytes_c_accum); 
+      cudaDeviceSynchronize();
 
-  float milliseconds = 0;
-  cudaEventElapsedTime(&milliseconds, start, stop);
+      cudaEventRecord(start);
+      wmmaGemmKernel<<<blocks, threads>>>(d_a, d_b, d_c_accum, d_c, M, N, K);
+      cudaEventRecord(stop);
+      cudaEventSynchronize(stop);
 
-  int num_c_elements = M * N;
-  int convert_threads = 256;
-  int convert_blocks = (num_c_elements + convert_threads - 1) / convert_threads;
-  convertFloatToHalfKernel<<<convert_blocks, convert_threads>>>(d_c_accum, d_c, num_c_elements);
+      float ms = 0;
+      cudaEventElapsedTime(&ms, start, stop);
+      times_wmma.push_back(ms);
+  }
+
+  float total_time_wmma = std::accumulate(times_wmma.begin(), times_wmma.end(), 0.0f);
+  float avg_time_wmma = total_time_wmma / NUM_ITERATIONS;
+  double avg_gflops_wmma = (2.0 * M * N * K * 1e-9) / (avg_time_wmma * 1e-3);
+  std::cout << "WMMA Kernel Avg Execution Time: " << avg_time_wmma << " ms" << std::endl;
+  std::cout << "WMMA Kernel Avg GFLOPs: " << avg_gflops_wmma << std::endl;
+
+  std::cout << "\n--- Running cuBLAS Kernel (" << NUM_ITERATIONS << " iterations) ---" << std::endl;
+  cublasHandle_t cublas_handle;
+  CUBLAS_CHECK(cublasCreate(&cublas_handle));
+  std::vector<float> times_cublas;
+  times_cublas.reserve(NUM_ITERATIONS);
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+
+  cudaMemset(d_c_accum, 0, bytes_c_accum);
+  CUBLAS_CHECK(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
+                            &alpha, d_b, CUDA_R_16F, N, d_a, CUDA_R_16F, K, &beta,
+                            d_c_accum, CUDA_R_32F, N, CUBLAS_COMPUTE_32F,
+                            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
   cudaDeviceSynchronize();
 
-  cudaMemcpy(h_c.data(), d_c, bytes_c, cudaMemcpyDeviceToHost);
-  cudaDeviceSynchronize();
+  for (int i = 0; i < NUM_ITERATIONS; ++i) {
+      cudaMemset(d_c_accum, 0, bytes_c_accum);
+      cudaDeviceSynchronize();
 
-  verify_result(h_a, h_b, h_c);
+      cudaEventRecord(start);
+      CUBLAS_CHECK(cublasGemmEx(cublas_handle,
+                                CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
+                                &alpha,
+                                d_b, CUDA_R_16F, N,
+                                d_a, CUDA_R_16F, K,
+                                &beta,
+                                d_c_accum, CUDA_R_32F, N,
+                                CUBLAS_COMPUTE_32F,
+                                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+      cudaEventRecord(stop);
+      cudaEventSynchronize(stop);
 
-  std::cout << "WMMA Kernel Execution Time: " << milliseconds << " ms" << std::endl;
+      float ms = 0;
+      cudaEventElapsedTime(&ms, start, stop);
+      times_cublas.push_back(ms);
+  }
 
-  double gflops = (2.0 * M * N * K * 1e-9) / (milliseconds * 1e-3);
-  std::cout << "GFLOPs: " << gflops << std::endl;
+  float total_time_cublas = std::accumulate(times_cublas.begin(), times_cublas.end(), 0.0f);
+  float avg_time_cublas = total_time_cublas / NUM_ITERATIONS;
+  double avg_gflops_cublas = (2.0 * M * N * K * 1e-9) / (avg_time_cublas * 1e-3);
+  std::cout << "cuBLAS Kernel Avg Execution Time: " << avg_time_cublas << " ms" << std::endl;
+  std::cout << "cuBLAS Kernel Avg GFLOPs: " << avg_gflops_cublas << std::endl;
 
   cudaFree(d_a);
   cudaFree(d_b);
@@ -129,8 +191,9 @@ int main() {
 
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
+  CUBLAS_CHECK(cublasDestroy(cublas_handle));
 
-  std::cout << "COMPLETED SUCCESSFULLY" << std::endl;
+  std::cout << "\nCOMPLETED SUCCESSFULLY" << std::endl;
   return 0;
 }
 
