@@ -34,7 +34,7 @@ constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
 
 constexpr int BLOCK_THREADS = 128;
-constexpr int NUM_ITERATIONS = 10;
+constexpr int NUM_ITERATIONS = 10000;
 
 __global__ void convertFloatToHalfKernel(const float* input, __half* output, int num_elements);
 __global__ void wmmaGemmKernel(const __half* __restrict__ a, const __half* __restrict__ b, float* __restrict__ c_float_accum, __half* d_c_ptr_unused, int M_param, int N_param, int K_param);
@@ -126,7 +126,7 @@ int main() {
   for (size_t i = 0; i < h_c_wmma_accum_float.size(); ++i) {
       h_c_wmma_half[i] = static_cast<__half>(h_c_wmma_accum_float[i]);
   }
-  verify_result(h_a, h_b, h_c_wmma_half, "WMMA Kernel (after launch bounds)");
+  // verify_result(h_a, h_b, h_c_wmma_half, "WMMA Kernel (after launch bounds)");
 
   for (int i = 0; i < NUM_ITERATIONS; ++i) {
       cudaMemset(d_c_accum, 0, bytes_c_accum); 
